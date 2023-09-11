@@ -17,68 +17,80 @@
 
 package com.velocitypowered.proxy.protocol.netty;
 
-import static com.velocitypowered.natives.util.MoreByteBufUtils.ensureCompatible;
 import static com.velocitypowered.natives.util.MoreByteBufUtils.preferredBuffer;
 import static com.velocitypowered.proxy.protocol.util.NettyPreconditions.checkFrame;
 
 import com.velocitypowered.natives.compression.VelocityCompressor;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
+import com.velocitypowered.proxy.protocol.netty.data.CompressedPacket;
+import com.velocitypowered.proxy.protocol.netty.data.UncompressedPacket;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import java.util.List;
 
 /**
- * Decompresses a Minecraft packet.
+ * Decompresses a Minecraft packet and decodes id.
  */
-public class MinecraftCompressDecoder extends MessageToMessageDecoder<ByteBuf> {
-
-  private static final int VANILLA_MAXIMUM_UNCOMPRESSED_SIZE = 8 * 1024 * 1024; // 8MiB
-  private static final int HARD_MAXIMUM_UNCOMPRESSED_SIZE = 16 * 1024 * 1024; // 16MiB
-
-  private static final int UNCOMPRESSED_CAP =
-      Boolean.getBoolean("velocity.increased-compression-cap")
-          ? HARD_MAXIMUM_UNCOMPRESSED_SIZE : VANILLA_MAXIMUM_UNCOMPRESSED_SIZE;
+public class MinecraftCompressAndIdDecoder extends MessageToMessageDecoder<ByteBuf> {
 
   private int threshold;
   private final VelocityCompressor compressor;
+  private final VelocityCompressor javaCompressor;
 
-  public MinecraftCompressDecoder(int threshold, VelocityCompressor compressor) {
+  /**
+   * Constructs new Minecraft packet decompressor and id decoder.
+   *
+   * @param threshold Compression threshold.
+   * @param compressor Preferred compressor.
+   * @param javaCompressor Java compressor for partial decompression.
+   */
+  public MinecraftCompressAndIdDecoder(int threshold, VelocityCompressor compressor,
+                                       VelocityCompressor javaCompressor) {
     this.threshold = threshold;
     this.compressor = compressor;
+    this.javaCompressor = javaCompressor;
+  }
+
+  public MinecraftCompressAndIdDecoder() {
+    this(0, null, null);
   }
 
   @Override
   protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+    if (threshold <= 0) {
+      int originalReaderIndex = in.readerIndex();
+      int packetId = ProtocolUtils.readVarInt(in);
+      out.add(new UncompressedPacket(packetId, in.readerIndex(originalReaderIndex).retain()));
+      return;
+    }
+
     int claimedUncompressedSize = ProtocolUtils.readVarInt(in);
     if (claimedUncompressedSize == 0) {
-      // This message is not compressed.
-      out.add(in.retain());
+      int originalReaderIndex = in.readerIndex();
+      int packetId = ProtocolUtils.readVarInt(in);
+      out.add(new UncompressedPacket(packetId, in.readerIndex(originalReaderIndex).retain()));
       return;
     }
 
     checkFrame(claimedUncompressedSize >= threshold, "Uncompressed size %s is less than"
         + " threshold %s", claimedUncompressedSize, threshold);
-    checkFrame(claimedUncompressedSize <= UNCOMPRESSED_CAP,
-        "Uncompressed size %s exceeds hard threshold of %s", claimedUncompressedSize,
-        UNCOMPRESSED_CAP);
 
-    ByteBuf compatibleIn = ensureCompatible(ctx.alloc(), compressor, in);
-    ByteBuf uncompressed = preferredBuffer(ctx.alloc(), compressor, claimedUncompressedSize);
-    try {
-      compressor.inflate(compatibleIn, uncompressed, claimedUncompressedSize);
-      out.add(uncompressed);
-    } catch (Exception e) {
-      uncompressed.release();
-      throw e;
-    } finally {
-      compatibleIn.release();
-    }
+    ByteBuf packetIdBuf = preferredBuffer(ctx.alloc(), this.compressor, 5);
+    int readerIndex = in.readerIndex();
+    this.javaCompressor.inflatePartial(in, packetIdBuf, 5);
+    in.readerIndex(readerIndex);
+    int packetId = ProtocolUtils.readVarInt(packetIdBuf);
+    packetIdBuf.release();
+
+    out.add(new CompressedPacket(packetId, claimedUncompressedSize, in.retain(), this.compressor));
   }
 
   @Override
   public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
-    compressor.close();
+    if (compressor != null) {
+      compressor.close();
+    }
   }
 
   public void setThreshold(int threshold) {
